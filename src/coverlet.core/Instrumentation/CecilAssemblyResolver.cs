@@ -1,8 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 using Coverlet.Core.Abstracts;
 using Coverlet.Core.Exceptions;
 using Microsoft.Extensions.DependencyModel;
@@ -43,7 +42,7 @@ namespace Coverlet.Core.Instrumentation
         private static readonly AssemblyDefinition _assemblyDefinition;
 
         private readonly string _modulePath;
-        private readonly Lazy<CompositeCompilationAssemblyResolver> _compositeResolver;
+        private readonly Lazy<ICompilationAssemblyResolver[]> _assemblyResolvers;
         private readonly ILogger _logger;
 
         static NetstandardAwareAssemblyResolver()
@@ -70,13 +69,13 @@ namespace Coverlet.Core.Instrumentation
 
             // this is lazy because we cannot create AspNetCoreSharedFrameworkResolver if not on .NET Core runtime, 
             // runtime folders are different
-            _compositeResolver = new Lazy<CompositeCompilationAssemblyResolver>(() => new CompositeCompilationAssemblyResolver(new ICompilationAssemblyResolver[]
+            _assemblyResolvers = new Lazy<ICompilationAssemblyResolver[]>(() => new ICompilationAssemblyResolver[]
             {
-                new AspNetCoreSharedFrameworkResolver(_logger),
                 new AppBaseCompilationAssemblyResolver(),
                 new ReferenceAssemblyPathResolver(),
-                new PackageCompilationAssemblyResolver()
-            }), true);
+                new PackageCompilationAssemblyResolver(),
+                new AspNetCoreSharedFrameworkResolver(_logger)
+            }, true);
         }
 
         // Check name and public key but not version that could be different
@@ -166,45 +165,32 @@ namespace Coverlet.Core.Instrumentation
             }
 
             using DependencyContextJsonReader contextJsonReader = new DependencyContextJsonReader();
-            Dictionary<string, Lazy<AssemblyDefinition>> libraries = new Dictionary<string, Lazy<AssemblyDefinition>>();
             foreach (string fileName in Directory.GetFiles(Path.GetDirectoryName(_modulePath), "*.deps.json"))
             {
                 using FileStream depsFile = File.OpenRead(fileName);
                 _logger.LogVerbose($"Loading {fileName}");
                 DependencyContext dependencyContext = contextJsonReader.Read(depsFile);
-                foreach (CompilationLibrary library in dependencyContext.CompileLibraries)
-                {
-                    // we're interested only on nuget package
-                    if (library.Type == "project")
-                    {
-                        continue;
-                    }
 
+                var compileLibrary = dependencyContext.CompileLibraries.FirstOrDefault(l => l.Name == name.Name);
+                if (compileLibrary != null)
+                {
                     try
                     {
-                        string path = library.ResolveReferencePaths(_compositeResolver.Value).FirstOrDefault();
-                        if (string.IsNullOrEmpty(path))
+                        var assemblies = new List<string>();
+                        foreach (var assemblyResolver in _assemblyResolvers.Value)
                         {
-                            continue;
-                        }
-
-                        // We could load more than one deps file, we need to check if lib is already found
-                        if (!libraries.ContainsKey(library.Name))
-                        {
-                            libraries.Add(library.Name, new Lazy<AssemblyDefinition>(() => AssemblyDefinition.ReadAssembly(path, new ReaderParameters() { AssemblyResolver = this })));
+                            if (assemblyResolver.TryResolveAssemblyPaths(compileLibrary, assemblies) && assemblies.Count > 0)
+                            {
+                                return AssemblyDefinition.ReadAssembly(assemblies[0], new ReaderParameters { AssemblyResolver = this });
+                            }
                         }
                     }
                     catch (Exception ex)
                     {
                         // if we don't find a lib go on
-                        _logger.LogVerbose($"TryWithCustomResolverOnDotNetCore exception: {ex.ToString()}");
+                        _logger.LogVerbose($"TryWithCustomResolverOnDotNetCore exception: {ex}");
                     }
                 }
-            }
-
-            if (libraries.TryGetValue(name.Name, out Lazy<AssemblyDefinition> asm))
-            {
-                return asm.Value;
             }
 
             throw new CecilAssemblyResolutionException($"AssemblyResolutionException for '{name}'. Try to add <PreserveCompilationContext>true</PreserveCompilationContext> to test projects </PropertyGroup> or pass '/p:CopyLocalLockFileAssemblies=true' option to the 'dotnet test' command-line", new AssemblyResolutionException(name));
